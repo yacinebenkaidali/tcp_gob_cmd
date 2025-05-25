@@ -33,17 +33,14 @@ func main() {
 
 	go func() {
 		for cmd := range commandsCh {
+			//cast commands ch and do business logic
 			log.Println("received this command after parsing", cmd)
 		}
 	}()
 
 	cm.StartServer(":8000")
 
-	select {
-	case <-quitCh:
-		{
-			cm.Shutdown()
-			log.Println("Received kill signal, closing off connection and server")
-		}
-	}
+	<-quitCh
+	cm.Shutdown()
+	log.Println("Received kill signal, closing off connection and server")
 }

@@ -1,14 +1,14 @@
 package cmmanager
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"encoding/binary"
-	"encoding/gob"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -165,6 +165,14 @@ func (cm *ConnectionManager) handleConnectionRead(conn *Connection) {
 		cm.wg.Done()
 		cm.closeConnection(conn, nil)
 	}()
+	f, err := os.Create("./lorem.dat")
+	if err != nil {
+		log.Fatal("Error creating a file")
+		return
+	}
+	defer f.Close()
+	writer := bufio.NewWriter(f)
+	var readBuffSize uint64 = 4096
 
 	for {
 		select {
@@ -172,7 +180,7 @@ func (cm *ConnectionManager) handleConnectionRead(conn *Connection) {
 			return
 		default:
 			{
-				lengthPrefixBytes := make([]byte, 4)
+				lengthPrefixBytes := make([]byte, 8)
 				_, err := io.ReadFull(conn.conn, lengthPrefixBytes)
 				if err != nil {
 					if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -182,9 +190,12 @@ func (cm *ConnectionManager) handleConnectionRead(conn *Connection) {
 					log.Printf("Error reading length prefix from %s: %v", (conn.conn).RemoteAddr(), err)
 					return
 				}
-				commandLength := binary.BigEndian.Uint32(lengthPrefixBytes)
+				// first successfull read
+				conn.LastPing = time.Now()
+
+				commandLength := binary.BigEndian.Uint64(lengthPrefixBytes)
 				// Basic sanity check for command length (optional but recommended)
-				if commandLength > 10*1024*1024 { // e.g., max 10MB command
+				if commandLength >= 10*1024*1024*1024*1024 { // e.g., max 100MB command
 					log.Printf("Command length %d exceeds maximum allowed size from %s", commandLength, conn.conn.RemoteAddr())
 					return // Or send an error response
 				}
@@ -192,27 +203,38 @@ func (cm *ConnectionManager) handleConnectionRead(conn *Connection) {
 					log.Printf("Received zero length command from %s, potentially keep-alive or error.", conn.conn.RemoteAddr())
 					continue // Decide how to handle this; could be a protocol-specific keep-alive
 				}
-				commandBytes := make([]byte, commandLength)
-				_, err = io.ReadFull(conn.conn, commandBytes)
-				if err != nil {
-					if err == io.EOF || err == io.ErrUnexpectedEOF {
-						log.Printf("Client disconnected while reading command body: %s", conn.conn.RemoteAddr())
-					} else {
-						log.Printf("Error reading command body from %s: %v", conn.conn.RemoteAddr(), err)
+				if commandLength < readBuffSize {
+					readBuffSize = commandLength
+				}
+				log.Printf("Read from client file with size%d", commandLength)
+				var currentReadSize uint64 = 0
+				for {
+					if commandLength-currentReadSize < readBuffSize {
+						readBuffSize = commandLength - currentReadSize
 					}
-					return
+					buff := make([]byte, readBuffSize)
+					readSize, err := io.ReadFull(conn.conn, buff)
+					if err != nil {
+						log.Println("Error while reading file content")
+						break
+					}
+					if readSize > 0 {
+						nn, err := writer.Write(buff[:readSize])
+						if err != nil {
+							log.Println("Error while writing file content")
+							break
+						}
+						currentReadSize += uint64(nn)
+						if currentReadSize == commandLength {
+							// end of the current file, the content should have been written to local file
+							break
+						}
+					}
 				}
-				var cmd actions.Command
-				docoder := gob.NewDecoder(bytes.NewReader(commandBytes))
-				if err := docoder.Decode(&cmd); err != nil {
-					log.Printf("Error gob decoding command from %s: %v", conn.conn.RemoteAddr(), err)
-					// Optionally, you might try to recover or just close the connection
-					continue // or return
+				if err := writer.Flush(); err != nil {
+					log.Println("There was a problem flushing content to disk")
 				}
-				conn.LastPing = time.Now()
-				if cm.onMessage != nil {
-					cm.onMessage(&conn.conn, cmd)
-				}
+				log.Printf("done writing file %d\n", currentReadSize)
 			}
 		}
 	}

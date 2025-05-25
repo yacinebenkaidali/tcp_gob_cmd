@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
 )
 
 // It's good practice to register your types with gob, especially if they are interfaces
@@ -57,14 +60,49 @@ func main() {
 	}
 	defer conn.Close()
 
-	command := MyCommand{Action: "CREATE_USER", Payload: "Alice"}
-	if err := sendCommand(conn, command); err != nil {
-		log.Printf("Error sending command: %v", err)
+	f, err := os.Open("./bigdata.dat")
+	if err != nil {
+		log.Fatalf("Failed to open file: %v", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		log.Fatalf("Failed to get file size: %v", err)
+	}
+	buffSize := make([]byte, 8)
+	binary.BigEndian.PutUint64(buffSize, uint64(fi.Size()))
+
+	_, err = conn.Write(buffSize)
+	if err != nil {
+		log.Fatalf("Error writing file size: %v", err)
 	}
 
-	command2 := MyCommand{Action: "GET_DATA", Payload: map[string]int{"id": 123}}
-	if err := sendCommand(conn, command2); err != nil {
-		log.Printf("Error sending command: %v", err)
+	reader := bufio.NewReader(f)
+	buff := make([]byte, 4096)
+	for {
+		n, err := reader.Read(buff)
+		if err != nil {
+			if io.EOF == err || io.ErrUnexpectedEOF == err {
+				return
+			}
+		}
+		if n > 0 {
+			_, err = conn.Write(buff[:n]) // Note: using buff[:n] to write only what was read
+			if err != nil {
+				switch err := err.(type) {
+				case *net.OpError:
+					// Handles network operation errors like connection refused, timeout
+					log.Fatalf("Network operation error: %v", err)
+					return
+				default:
+					// Handle other errors like:
+					// - Connection reset by peer
+					// - Broken pipe
+					// - Connection timeout
+					log.Fatalf("Write error: %v", err)
+				}
+			}
+		}
 	}
-	// ... send more commands
+	log.Println("Done transfering file")
 }
