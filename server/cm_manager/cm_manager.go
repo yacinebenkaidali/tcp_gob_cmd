@@ -1,13 +1,18 @@
 package cmmanager
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/gob"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
 	"time"
+
+	actions "github.com/yacinebenkaidali/tcp_gob_server/commands"
 )
 
 type Connection struct {
@@ -33,7 +38,7 @@ type ConnectionManager struct {
 	writeTimeout time.Duration
 
 	onConnect    func(conn *net.Conn)
-	onMessage    func(conn *net.Conn, data []byte)
+	onMessage    func(conn *net.Conn, cmd actions.Command)
 	onDisconnect func(conn *net.Conn, err error)
 }
 
@@ -44,7 +49,7 @@ type ConnectionConfig struct {
 	WriteTimeout time.Duration
 
 	OnConnect    func(conn *net.Conn)
-	OnMessage    func(conn *net.Conn, data []byte)
+	OnMessage    func(conn *net.Conn, cmd actions.Command)
 	OnDisconnect func(conn *net.Conn, err error)
 }
 
@@ -161,29 +166,52 @@ func (cm *ConnectionManager) handleConnectionRead(conn *Connection) {
 		cm.closeConnection(conn, nil)
 	}()
 
-	buff := make([]byte, 4096)
 	for {
 		select {
 		case <-conn.ctx.Done():
 			return
 		default:
 			{
-				n, err := conn.conn.Read(buff)
+				lengthPrefixBytes := make([]byte, 4)
+				_, err := io.ReadFull(conn.conn, lengthPrefixBytes)
 				if err != nil {
-					if netErr, ok := (err).(net.Error); ok && netErr.Timeout() {
-						continue
-					}
 					if err == io.EOF || err == io.ErrUnexpectedEOF {
+						log.Printf("Client disconnected: %s", (conn.conn).RemoteAddr())
 						return
 					}
+					log.Printf("Error reading length prefix from %s: %v", (conn.conn).RemoteAddr(), err)
+					return
 				}
-				if n > 0 {
-					conn.LastPing = time.Now()
-					if cm.onMessage != nil {
-						resBuff := make([]byte, n)
-						copy(resBuff, buff[:n])
-						cm.onMessage(&conn.conn, resBuff)
+				commandLength := binary.BigEndian.Uint32(lengthPrefixBytes)
+				// Basic sanity check for command length (optional but recommended)
+				if commandLength > 10*1024*1024 { // e.g., max 10MB command
+					log.Printf("Command length %d exceeds maximum allowed size from %s", commandLength, conn.conn.RemoteAddr())
+					return // Or send an error response
+				}
+				if commandLength == 0 {
+					log.Printf("Received zero length command from %s, potentially keep-alive or error.", conn.conn.RemoteAddr())
+					continue // Decide how to handle this; could be a protocol-specific keep-alive
+				}
+				commandBytes := make([]byte, commandLength)
+				_, err = io.ReadFull(conn.conn, commandBytes)
+				if err != nil {
+					if err == io.EOF || err == io.ErrUnexpectedEOF {
+						log.Printf("Client disconnected while reading command body: %s", conn.conn.RemoteAddr())
+					} else {
+						log.Printf("Error reading command body from %s: %v", conn.conn.RemoteAddr(), err)
 					}
+					return
+				}
+				var cmd actions.Command
+				docoder := gob.NewDecoder(bytes.NewReader(commandBytes))
+				if err := docoder.Decode(&cmd); err != nil {
+					log.Printf("Error gob decoding command from %s: %v", conn.conn.RemoteAddr(), err)
+					// Optionally, you might try to recover or just close the connection
+					continue // or return
+				}
+				conn.LastPing = time.Now()
+				if cm.onMessage != nil {
+					cm.onMessage(&conn.conn, cmd)
 				}
 			}
 		}
@@ -234,7 +262,7 @@ func (cm *ConnectionManager) handleMonitoringConnection(conn *Connection) {
 		case <-ticker.C:
 			{
 				if time.Since(conn.LastPing) > cm.pingInterval*3 {
-					cm.closeConnection(conn, fmt.Errorf("connection with id %s appears to be stable", conn.ID))
+					cm.closeConnection(conn, fmt.Errorf("connection with id %s appears to be unstable", conn.ID))
 					return
 				}
 			}
