@@ -165,14 +165,11 @@ func (cm *ConnectionManager) handleConnectionRead(conn *Connection) {
 		cm.wg.Done()
 		cm.closeConnection(conn, nil)
 	}()
-	f, err := os.Create("./lorem.dat")
-	if err != nil {
-		log.Fatal("Error creating a file")
-		return
-	}
-	defer f.Close()
-	writer := bufio.NewWriter(f)
-	var readBuffSize uint64 = 4096
+
+	const (
+		defaultBufferSize = 4096
+		maxFileSize       = 1 * 1024 * 1024 * 1024 // 1GB max file size
+	)
 
 	for {
 		select {
@@ -195,7 +192,7 @@ func (cm *ConnectionManager) handleConnectionRead(conn *Connection) {
 
 				commandLength := binary.BigEndian.Uint64(lengthPrefixBytes)
 				// Basic sanity check for command length (optional but recommended)
-				if commandLength >= 10*1024*1024*1024*1024 { // e.g., max 100MB command
+				if commandLength >= maxFileSize { // e.g., max 100MB command
 					log.Printf("Command length %d exceeds maximum allowed size from %s", commandLength, conn.conn.RemoteAddr())
 					return // Or send an error response
 				}
@@ -203,23 +200,27 @@ func (cm *ConnectionManager) handleConnectionRead(conn *Connection) {
 					log.Printf("Received zero length command from %s, potentially keep-alive or error.", conn.conn.RemoteAddr())
 					continue // Decide how to handle this; could be a protocol-specific keep-alive
 				}
-				if commandLength < readBuffSize {
-					readBuffSize = commandLength
+				filename := fmt.Sprintf("./transfer_%s_%d.dat", conn.ID, time.Now().UnixNano())
+				f, err := os.Create(filename)
+				if err != nil {
+					log.Fatal("Error creating a file")
+					return
 				}
-				log.Printf("Read from client file with size%d", commandLength)
+				defer f.Close()
+				writer := bufio.NewWriter(f)
+
 				var currentReadSize uint64 = 0
+
+				buff := make([]byte, defaultBufferSize)
 				for {
-					if commandLength-currentReadSize < readBuffSize {
-						readBuffSize = commandLength - currentReadSize
-					}
-					buff := make([]byte, readBuffSize)
-					readSize, err := io.ReadFull(conn.conn, buff)
+					var readSize = min(commandLength-currentReadSize, defaultBufferSize)
+					n, err := io.ReadFull(conn.conn, buff[:readSize])
 					if err != nil {
 						log.Println("Error while reading file content")
 						break
 					}
-					if readSize > 0 {
-						nn, err := writer.Write(buff[:readSize])
+					if n > 0 {
+						nn, err := writer.Write(buff[:n])
 						if err != nil {
 							log.Println("Error while writing file content")
 							break
@@ -234,7 +235,19 @@ func (cm *ConnectionManager) handleConnectionRead(conn *Connection) {
 				if err := writer.Flush(); err != nil {
 					log.Println("There was a problem flushing content to disk")
 				}
-				log.Printf("done writing file %d\n", currentReadSize)
+				if err := f.Close(); err != nil {
+					log.Println("There was a problem flushing content to disk")
+				}
+				if currentReadSize == commandLength {
+					log.Printf("Successfully wrote file %s (%d bytes)", filename, currentReadSize)
+				} else {
+					log.Printf("Incomplete file transfer %s: got %d of %d bytes",
+						filename, currentReadSize, commandLength)
+					// Optionally delete incomplete file
+					if err := os.Remove(filename); err != nil {
+						log.Printf("Error removing incomplete file %s: %v", filename, err)
+					}
+				}
 			}
 		}
 	}
